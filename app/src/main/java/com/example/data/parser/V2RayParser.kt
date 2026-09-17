@@ -4,6 +4,7 @@ import android.net.Uri
 import android.util.Base64
 import com.example.data.model.ProtocolType
 import com.example.data.model.ServerConfig
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
@@ -11,30 +12,51 @@ import java.nio.charset.StandardCharsets
 object V2RayParser {
 
     /**
-     * Decodes a subscription content which may be base64 encoded or plain text,
-     * and extracts all valid server configs.
+     * Decodes subscription content which may be plain text, base64 encoded,
+     * JSON wrapped, URL encoded, or contain multiple config URIs in one line.
      */
     fun parseSubscriptionContent(content: String, subscriptionId: Long? = null): List<ServerConfig> {
-        val trimmed = content.trim()
-        val plainText = decodeBase64Safely(trimmed) ?: trimmed
+        val candidates = mutableListOf<String>()
+        val original = content.trim().removePrefix("\uFEFF")
 
-        // Ensure consecutive config URIs without newlines are properly split
-        val normalized = plainText.replace(
-            Regex("(?<=[^\\r\\n])(?=(?:vmess|vless|trojan|ss)://)", RegexOption.IGNORE_CASE),
-            "\n"
-        )
+        // Try the original body first, then decoded/nested forms.
+        addCandidate(candidates, original)
+        decodeBase64Safely(original)?.let { addCandidate(candidates, it) }
+        decodeUrlComponent(original).takeIf { it != original }?.let { addCandidate(candidates, it) }
+
+        val jsonUnwrapped = unwrapJsonSubscription(original)
+        if (jsonUnwrapped != null) {
+            addCandidate(candidates, jsonUnwrapped)
+            decodeBase64Safely(jsonUnwrapped)?.let { addCandidate(candidates, it) }
+        }
 
         val servers = mutableListOf<ServerConfig>()
-        val lines = normalized.split("\r\n", "\n", "\r")
+        val seen = mutableSetOf<String>()
 
-        for (line in lines) {
-            val configLine = line.trim()
-            if (configLine.isBlank() || configLine.startsWith("#")) continue
-            val parsed = parseUri(configLine, subscriptionId)
-            if (parsed != null) {
-                servers.add(parsed)
+        for (candidate in candidates) {
+            // Some providers return several URIs without line breaks, or wrap
+            // them in text/HTML. Extract supported URI schemes anywhere in body.
+            val extracted = extractConfigUris(candidate)
+            for (uri in extracted) {
+                if (!seen.add(uri)) continue
+                parseUri(uri, subscriptionId)?.let { servers.add(it) }
+            }
+
+            // Also support ordinary line-separated content.
+            val normalized = candidate
+                .replace("\r", "\n")
+                .replace("\\n", "\n")
+                .replace("(?i)<br\\s*/?>".toRegex(), "\n")
+
+            normalized.split('\n').forEach { line ->
+                val configLine = line.trim().trim('"', '\'', ',', '[', ']')
+                if (configLine.isBlank() || configLine.startsWith("#")) return@forEach
+                parseUri(configLine, subscriptionId)?.let {
+                    if (seen.add(it.rawUri)) servers.add(it)
+                }
             }
         }
+
         return servers
     }
 
@@ -42,7 +64,7 @@ object V2RayParser {
      * Parses a single VPN configuration URI (vmess://, vless://, trojan://, ss://)
      */
     fun parseUri(uriString: String, subscriptionId: Long? = null): ServerConfig? {
-        val trimmed = uriString.trim()
+        val trimmed = uriString.trim().trim('"', '\'', ',', '[', ']')
         return try {
             when {
                 trimmed.startsWith("vmess://", ignoreCase = true) -> parseVMess(trimmed, subscriptionId)
@@ -56,9 +78,6 @@ object V2RayParser {
         }
     }
 
-    /**
-     * Parses vmess://<base64>
-     */
     private fun parseVMess(uriString: String, subscriptionId: Long?): ServerConfig? {
         val rawBase64 = uriString.substring(8).trim()
         val jsonString = decodeBase64Safely(rawBase64) ?: return null
@@ -100,9 +119,6 @@ object V2RayParser {
         )
     }
 
-    /**
-     * Parses vless://uuid@host:port?query#name
-     */
     private fun parseVLess(uriString: String, subscriptionId: Long?): ServerConfig? {
         val uri = Uri.parse(uriString)
         val userInfo = uri.userInfo ?: ""
@@ -145,9 +161,6 @@ object V2RayParser {
         )
     }
 
-    /**
-     * Parses trojan://password@host:port?query#name
-     */
     private fun parseTrojan(uriString: String, subscriptionId: Long?): ServerConfig? {
         val uri = Uri.parse(uriString)
         val password = uri.userInfo ?: ""
@@ -182,9 +195,6 @@ object V2RayParser {
         )
     }
 
-    /**
-     * Parses ss://<encoded>#name or ss://method:pass@host:port#name (SIP002)
-     */
     private fun parseShadowsocks(uriString: String, subscriptionId: Long?): ServerConfig? {
         val raw = uriString.substring(5)
         val hashIdx = raw.indexOf('#')
@@ -197,20 +207,16 @@ object V2RayParser {
         val name = namePart.ifBlank { "Shadowsocks Server" }
 
         return if (body.contains("@")) {
-            // SIP002 format: ss://base64(method:password)@hostname:port
             val atIdx = body.indexOf('@')
             val userPart = body.substring(0, atIdx)
             val hostPart = body.substring(atIdx + 1)
-
             val decodedUser = decodeBase64Safely(userPart) ?: userPart
             val methodAndPass = decodedUser.split(":", limit = 2)
             val method = methodAndPass.getOrElse(0) { "aes-256-gcm" }
             val password = methodAndPass.getOrElse(1) { "" }
-
             val hostAndPort = hostPart.split(":", limit = 2)
             val address = hostAndPort.getOrElse(0) { "" }
             val port = hostAndPort.getOrNull(1)?.toIntOrNull() ?: 8388
-
             if (address.isBlank()) return null
 
             ServerConfig(
@@ -224,22 +230,17 @@ object V2RayParser {
                 rawUri = uriString
             )
         } else {
-            // Old format: ss://base64(method:password@hostname:port)
             val decoded = decodeBase64Safely(body) ?: return null
             val atIdx = decoded.indexOf('@')
             if (atIdx < 0) return null
-
             val userPart = decoded.substring(0, atIdx)
             val hostPart = decoded.substring(atIdx + 1)
-
             val methodAndPass = userPart.split(":", limit = 2)
             val method = methodAndPass.getOrElse(0) { "aes-256-gcm" }
             val password = methodAndPass.getOrElse(1) { "" }
-
             val hostAndPort = hostPart.split(":", limit = 2)
             val address = hostAndPort.getOrElse(0) { "" }
             val port = hostAndPort.getOrNull(1)?.toIntOrNull() ?: 8388
-
             if (address.isBlank()) return null
 
             ServerConfig(
@@ -255,13 +256,58 @@ object V2RayParser {
         }
     }
 
+    /** Extract supported config URIs even when the provider puts them in JSON/HTML/text. */
+    private fun extractConfigUris(input: String): List<String> {
+        val schemes = "vmess|vless|trojan|ss"
+        val regex = Regex("(?i)(?:$schemes)://[^\\s\\\"'<>\\]++")
+        return regex.findAll(input)
+            .map { it.value.trimEnd(',', ';', ')', ']', '}') }
+            .filter { it.isNotBlank() }
+            .toList()
+    }
+
+    private fun unwrapJsonSubscription(input: String): String? {
+        val trimmed = input.trim()
+        if (!(trimmed.startsWith("{") || trimmed.startsWith("["))) return null
+        return try {
+            if (trimmed.startsWith("[")) {
+                val array = JSONArray(trimmed)
+                buildString {
+                    for (i in 0 until array.length()) {
+                        val item = array.opt(i)
+                        if (item is String) append(item).append('\n')
+                        else if (item is JSONObject) {
+                            append(item.optString("url", ""))
+                                .append('\n')
+                        }
+                    }
+                }
+            } else {
+                val obj = JSONObject(trimmed)
+                listOf("content", "data", "subscription", "links", "url")
+                    .firstNotNullOfOrNull { key ->
+                        obj.optString(key, "").takeIf { it.isNotBlank() }
+                    }
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun addCandidate(list: MutableList<String>, value: String) {
+        val clean = value.trim().removePrefix("\uFEFF")
+        if (clean.isNotBlank() && clean !in list) list.add(clean)
+    }
+
     private fun decodeBase64Safely(input: String): String? {
         val clean = input.trim()
+            .removePrefix("\uFEFF")
             .replace("\r", "")
             .replace("\n", "")
             .replace(" ", "")
 
-        // Pad with = if needed
+        if (clean.length < 8) return null
+
         val padded = when (clean.length % 4) {
             2 -> "$clean=="
             3 -> "$clean="
@@ -278,9 +324,12 @@ object V2RayParser {
         for (flag in flagsToTry) {
             try {
                 val bytes = Base64.decode(padded, flag)
-                if (bytes != null && bytes.isNotEmpty()) {
+                if (bytes.isNotEmpty()) {
                     val decoded = String(bytes, StandardCharsets.UTF_8)
-                    if (decoded.isNotBlank()) return decoded
+                    // Avoid treating arbitrary binary/base64 as a valid subscription.
+                    if (decoded.isNotBlank() && decoded.any { it == ':' || it == '/' || it == '{' }) {
+                        return decoded
+                    }
                 }
             } catch (_: Exception) {
             }
