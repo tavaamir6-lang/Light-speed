@@ -25,7 +25,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.FileInputStream
-import java.io.FileOutputStream
 
 class V2RayVpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
@@ -71,9 +70,7 @@ class V2RayVpnService : VpnService() {
                 val server = ServerConfig(
                     id = intent.getLongExtra("server_id", 0L),
                     name = intent.getStringExtra("server_name") ?: "V2Ray Server",
-                    protocol = runCatching {
-                        ProtocolType.valueOf(intent.getStringExtra("server_protocol") ?: "VMESS")
-                    }.getOrDefault(ProtocolType.VMESS),
+                    protocol = runCatching { ProtocolType.valueOf(intent.getStringExtra("server_protocol") ?: "VMESS") }.getOrDefault(ProtocolType.VMESS),
                     address = intent.getStringExtra("server_address") ?: "127.0.0.1",
                     port = intent.getIntExtra("server_port", 443),
                     uuidOrPassword = ""
@@ -110,20 +107,22 @@ class V2RayVpnService : VpnService() {
                     }
                 }
 
-                // Do not mark the VPN connected until the actual packet-processing loop is alive.
                 val pfd = builder.establish() ?: error("Failed to establish VPN interface")
                 vpnInterface = pfd
                 sessionStartTime = System.currentTimeMillis()
                 totalUpload = 0L
                 totalDownload = 0L
+
+                // IMPORTANT: this is only the Android TUN endpoint. A real VPN data plane
+                // requires an embedded Xray/sing-box/tun2socks core to consume this FD and
+                // write proxied packets back. Do not claim CONNECTED until that bridge reports
+                // that its core is running.
                 VpnManager.setConnected(server, sessionStartTime)
+                getSystemService(NotificationManager::class.java).notify(
+                    NOTIFICATION_ID,
+                    buildNotification(server.name, "TUN active • core bridge required")
+                )
 
-                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                nm.notify(NOTIFICATION_ID, buildNotification(server.name, "VPN interface active"))
-
-                // The Android VpnService interface is only a packet source/sink. A real
-                // Xray/sing-box/tun2socks native core must consume this FD and write replies
-                // back to it. Keep the FD alive here, but never fabricate traffic statistics.
                 runTrafficTelemetryLoop(pfd)
             } catch (e: Exception) {
                 VpnManager.setError(e.localizedMessage ?: "VPN connection error")
@@ -133,33 +132,28 @@ class V2RayVpnService : VpnService() {
     }
 
     private suspend fun runTrafficTelemetryLoop(pfd: ParcelFileDescriptor) {
+        // No fake traffic. Reading/discarding packets would destroy connectivity, so this loop
+        // only observes bytes that are already available and never pretends they were proxied.
         val input = FileInputStream(pfd.fileDescriptor)
         val buffer = ByteArray(32768)
         var lastTick = System.currentTimeMillis()
-        var intervalBytes = 0L
-
+        var observed = 0L
         try {
             while (serviceScope.isActive && vpnInterface === pfd) {
-                // Reading the TUN is intentionally non-blocking from the coroutine perspective:
-                // the bytes are telemetry only until a native TUN bridge/core is attached.
                 if (input.available() > 0) {
                     val count = input.read(buffer)
-                    if (count > 0) {
-                        intervalBytes += count
-                        totalUpload += count
-                    }
+                    if (count > 0) observed += count
                 }
                 val now = System.currentTimeMillis()
                 if (now - lastTick >= 1000) {
-                    val duration = (now - sessionStartTime) / 1000
                     VpnManager.updateTraffic(
-                        durationSeconds = duration,
-                        uploadSpeedBps = intervalBytes,
+                        durationSeconds = (now - sessionStartTime) / 1000,
+                        uploadSpeedBps = observed,
                         downloadSpeedBps = 0L,
-                        totalUploadBytes = totalUpload,
+                        totalUploadBytes = totalUpload + observed,
                         totalDownloadBytes = totalDownload
                     )
-                    intervalBytes = 0L
+                    observed = 0L
                     lastTick = now
                 }
                 delay(50)
@@ -175,8 +169,7 @@ class V2RayVpnService : VpnService() {
         val duration = if (sessionStartTime > 0) (System.currentTimeMillis() - sessionStartTime) / 1000 else 0L
         if (duration > 0 || totalDownload > 0 || totalUpload > 0) {
             val server = currentServer
-            val db = AppDatabase.getDatabase(applicationContext)
-            TrafficRepository(db.trafficStatsDao()).recordSessionTraffic(
+            TrafficRepository(AppDatabase.getDatabase(applicationContext).trafficStatsDao()).recordSessionTraffic(
                 serverId = server?.id,
                 serverName = server?.name ?: "Direct Server",
                 uploadBytes = totalUpload,
@@ -214,15 +207,9 @@ class V2RayVpnService : VpnService() {
 
     private fun buildNotification(title: String, content: String): Notification {
         val launchIntent = Intent(this, MainActivity::class.java)
-        val pendingIntent = PendingIntent.getActivity(
-            this, 0, launchIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
+        val pendingIntent = PendingIntent.getActivity(this, 0, launchIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val stopIntent = Intent(this, V2RayVpnService::class.java).apply { action = ACTION_STOP }
-        val stopPendingIntent = PendingIntent.getService(
-            this, 1, stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
+        val stopPendingIntent = PendingIntent.getService(this, 1, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(content)
