@@ -4,12 +4,15 @@ import android.content.Context
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import io.nekohasekai.libbox.BridgeOptions
+import io.nekohasekai.libbox.BridgeSession
 import io.nekohasekai.libbox.ConnectionOwner
 import io.nekohasekai.libbox.InterfaceUpdateListener
 import io.nekohasekai.libbox.LocalDNSTransport
 import io.nekohasekai.libbox.NeighborEntryIterator
 import io.nekohasekai.libbox.NeighborUpdateListener
 import io.nekohasekai.libbox.NetworkInterfaceIterator
+import io.nekohasekai.libbox.Notification
 import io.nekohasekai.libbox.PlatformInterface
 import io.nekohasekai.libbox.PlatformUser
 import io.nekohasekai.libbox.ShellSession
@@ -27,7 +30,7 @@ class SingBoxPlatform(
     override fun usePlatformAutoDetectInterfaceControl(): Boolean = true
 
     override fun autoDetectInterfaceControl(fd: Int) {
-        service.protect(fd)
+        check(service.protect(fd)) { "android: failed to protect core socket" }
     }
 
     override fun openTun(options: TunOptions): Int {
@@ -54,18 +57,20 @@ class SingBoxPlatform(
                     val address = r4.next()
                     builder.addRoute(address.address(), address.prefix())
                 }
-            } else if (options.inet4Address.hasNext()) {
+            } else {
                 builder.addRoute("0.0.0.0", 0)
             }
+
             val r6 = options.inet6RouteAddress
             if (r6.hasNext()) {
                 while (r6.hasNext()) {
                     val address = r6.next()
                     builder.addRoute(address.address(), address.prefix())
                 }
-            } else if (options.inet6Address.hasNext()) {
+            } else {
                 builder.addRoute("::", 0)
             }
+
             val dns = options.dnsServerAddress
             while (dns.hasNext()) builder.addDnsServer(dns.next())
 
@@ -100,11 +105,13 @@ class SingBoxPlatform(
     override fun getInterfaces(): NetworkInterfaceIterator = EmptyNetworkInterfaceIterator
     override fun underNetworkExtension(): Boolean = false
     override fun includeAllNetworks(): Boolean = false
-    override fun clearDNSCache() = Unit
     override fun readWIFIState(): WIFIState? = null
-    override fun localDNSTransport(): LocalDNSTransport? = null
+    override fun clearDNSCache() = Unit
+    override fun sendNotification(notification: Notification) = Unit
+    override fun cancelNotification(identifier: String, typeID: Int) = Unit
     override fun startNeighborMonitor(listener: NeighborUpdateListener?) = Unit
     override fun closeNeighborMonitor(listener: NeighborUpdateListener?) = Unit
+    override fun registerMyInterface(name: String?) = Unit
     override fun usePlatformShell(): Boolean = false
     override fun checkPlatformShell() = error("platform shell is not available")
     override fun openShellSession(
@@ -115,20 +122,17 @@ class SingBoxPlatform(
         rows: Int,
         cols: Int,
     ): ShellSession = error("platform shell is not available")
-    override fun readSystemSSHHostKey(): String = ""
-    override fun lookupSFTPServer(): String = ""
-    override fun tailscaleHostname(): String = "Light Speed"
-    override fun usePlatformBridge(): Boolean = false
-    override fun createBridge(options: io.nekohasekai.libbox.BridgeOptions?): io.nekohasekai.libbox.BridgeSession = error("bridge requires root")
-    override fun usePlatformAutoRedirect(): Boolean = false
-    override fun createAutoRedirect(options: ByteArray?, handler: io.nekohasekai.libbox.AutoRedirectHandler?): io.nekohasekai.libbox.AutoRedirectSession = error("auto redirect requires root")
     override fun lookupUser(username: String?): PlatformUser = PlatformUser().apply {
         this.username = username ?: ""
-        uid = android.os.Process.myUid().toLong()
-        gid = android.os.Process.myUid().toLong()
+        uid = android.os.Process.myUid()
+        gid = android.os.Process.myUid()
         homeDir = context.filesDir.absolutePath
     }
-    override fun registerMyInterface(name: String?) = Unit
+    override fun lookupSFTPServer(): String = ""
+    override fun readSystemSSHHostKey(): String = ""
+    override fun tailscaleHostname(): String = "Light Speed"
+    override fun usePlatformBridge(): Boolean = false
+    override fun createBridge(options: BridgeOptions?): BridgeSession = error("bridge requires root")
 
     fun close() {
         tun?.close()
