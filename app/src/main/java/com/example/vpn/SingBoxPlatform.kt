@@ -1,0 +1,148 @@
+package com.example.vpn
+
+import android.content.Context
+import android.net.VpnService
+import android.os.Build
+import android.os.ParcelFileDescriptor
+import io.nekohasekai.libbox.ConnectionOwner
+import io.nekohasekai.libbox.InterfaceUpdateListener
+import io.nekohasekai.libbox.LocalDNSTransport
+import io.nekohasekai.libbox.NeighborEntryIterator
+import io.nekohasekai.libbox.NeighborUpdateListener
+import io.nekohasekai.libbox.NetworkInterfaceIterator
+import io.nekohasekai.libbox.PlatformInterface
+import io.nekohasekai.libbox.PlatformUser
+import io.nekohasekai.libbox.ShellSession
+import io.nekohasekai.libbox.StringIterator
+import io.nekohasekai.libbox.TunOptions
+import io.nekohasekai.libbox.WIFIState
+
+class SingBoxPlatform(
+    private val service: VpnService,
+    private val context: Context,
+    private val onTunEstablished: (ParcelFileDescriptor) -> Unit,
+) : PlatformInterface {
+    private var tun: ParcelFileDescriptor? = null
+
+    override fun usePlatformAutoDetectInterfaceControl(): Boolean = true
+
+    override fun autoDetectInterfaceControl(fd: Int) {
+        service.protect(fd)
+    }
+
+    override fun openTun(options: TunOptions): Int {
+        check(VpnService.prepare(service) == null) { "android: missing VPN permission" }
+        val builder = service.Builder()
+            .setSession("Light Speed")
+            .setMtu(options.mtu)
+
+        val v4 = options.inet4Address
+        while (v4.hasNext()) {
+            val address = v4.next()
+            builder.addAddress(address.address(), address.prefix())
+        }
+        val v6 = options.inet6Address
+        while (v6.hasNext()) {
+            val address = v6.next()
+            builder.addAddress(address.address(), address.prefix())
+        }
+
+        if (options.autoRoute) {
+            val r4 = options.inet4RouteAddress
+            if (r4.hasNext()) {
+                while (r4.hasNext()) {
+                    val address = r4.next()
+                    builder.addRoute(address.address(), address.prefix())
+                }
+            } else if (options.inet4Address.hasNext()) {
+                builder.addRoute("0.0.0.0", 0)
+            }
+            val r6 = options.inet6RouteAddress
+            if (r6.hasNext()) {
+                while (r6.hasNext()) {
+                    val address = r6.next()
+                    builder.addRoute(address.address(), address.prefix())
+                }
+            } else if (options.inet6Address.hasNext()) {
+                builder.addRoute("::", 0)
+            }
+            val dns = options.dnsServerAddress
+            while (dns.hasNext()) builder.addDnsServer(dns.next())
+
+            val include = options.includePackage
+            while (include.hasNext()) runCatching { builder.addAllowedApplication(include.next()) }
+            val exclude = options.excludePackage
+            while (exclude.hasNext()) runCatching { builder.addDisallowedApplication(exclude.next()) }
+        }
+
+        tun?.close()
+        tun = builder.establish() ?: error("android: failed to establish VPN")
+        onTunEstablished(tun!!)
+        return tun!!.fd
+    }
+
+    override fun useProcFS(): Boolean = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+
+    override fun findConnectionOwner(
+        ipProtocol: Int,
+        sourceAddress: String,
+        sourcePort: Int,
+        destinationAddress: String,
+        destinationPort: Int,
+    ): ConnectionOwner = ConnectionOwner().apply {
+        userId = -1
+        userName = ""
+        setAndroidPackageNames(EmptyStringIterator)
+    }
+
+    override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) = Unit
+    override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener) = Unit
+    override fun getInterfaces(): NetworkInterfaceIterator = EmptyNetworkInterfaceIterator
+    override fun underNetworkExtension(): Boolean = false
+    override fun includeAllNetworks(): Boolean = false
+    override fun clearDNSCache() = Unit
+    override fun readWIFIState(): WIFIState? = null
+    override fun localDNSTransport(): LocalDNSTransport? = null
+    override fun startNeighborMonitor(listener: NeighborUpdateListener?) = Unit
+    override fun closeNeighborMonitor(listener: NeighborUpdateListener?) = Unit
+    override fun usePlatformShell(): Boolean = false
+    override fun checkPlatformShell() = error("platform shell is not available")
+    override fun openShellSession(
+        user: PlatformUser?,
+        command: String?,
+        environ: StringIterator?,
+        term: String?,
+        rows: Int,
+        cols: Int,
+    ): ShellSession = error("platform shell is not available")
+    override fun readSystemSSHHostKey(): String = ""
+    override fun lookupSFTPServer(): String = ""
+    override fun tailscaleHostname(): String = "Light Speed"
+    override fun usePlatformBridge(): Boolean = false
+    override fun createBridge(options: io.nekohasekai.libbox.BridgeOptions?): io.nekohasekai.libbox.BridgeSession = error("bridge requires root")
+    override fun usePlatformAutoRedirect(): Boolean = false
+    override fun createAutoRedirect(options: ByteArray?, handler: io.nekohasekai.libbox.AutoRedirectHandler?): io.nekohasekai.libbox.AutoRedirectSession = error("auto redirect requires root")
+    override fun lookupUser(username: String?): PlatformUser = PlatformUser().apply {
+        this.username = username ?: ""
+        uid = android.os.Process.myUid().toLong()
+        gid = android.os.Process.myUid().toLong()
+        homeDir = context.filesDir.absolutePath
+    }
+    override fun registerMyInterface(name: String?) = Unit
+
+    fun close() {
+        tun?.close()
+        tun = null
+    }
+
+    private object EmptyStringIterator : StringIterator {
+        override fun len(): Int = 0
+        override fun hasNext(): Boolean = false
+        override fun next(): String = ""
+    }
+
+    private object EmptyNetworkInterfaceIterator : NetworkInterfaceIterator {
+        override fun hasNext(): Boolean = false
+        override fun next(): io.nekohasekai.libbox.NetworkInterface = io.nekohasekai.libbox.NetworkInterface()
+    }
+}
