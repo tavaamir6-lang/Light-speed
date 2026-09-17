@@ -1,0 +1,6 @@
+{
+  "name": "Light Speed",
+  "description": "Fast and secure V2Ray and Xray client supporting VMess, VLESS, Trojan, and Shadowsocks with subscription manager, ping tester, traffic stats, and split tunneling.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
