@@ -12,24 +12,27 @@ import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.data.db.AppDatabase
-import com.example.data.model.PerAppMode
-import com.example.data.model.ProtocolType
-import com.example.data.model.RoutingMode
 import com.example.data.model.ServerConfig
-import com.example.data.repository.SettingsRepository
+import com.example.data.parser.SingBoxConfigGenerator
 import com.example.data.repository.TrafficRepository
+import io.nekohasekai.libbox.CommandServer
+import io.nekohasekai.libbox.CommandServerHandler
+import io.nekohasekai.libbox.Libbox
+import io.nekohasekai.libbox.OverrideOptions
+import io.nekohasekai.libbox.PlatformInterface
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import java.io.FileInputStream
+import kotlinx.coroutines.withContext
 
-class V2RayVpnService : VpnService() {
+class V2RayVpnService : VpnService(), CommandServerHandler {
+    private var commandServer: CommandServer? = null
+    private var platform: SingBoxPlatform? = null
     private var vpnInterface: ParcelFileDescriptor? = null
     private var serviceJob: Job? = null
-    private val serviceScope = CoroutineScope(Dispatchers.IO)
+    private val scope = CoroutineScope(Dispatchers.IO)
     private var currentServer: ServerConfig? = null
     private var sessionStartTime = 0L
     private var totalUpload = 0L
@@ -40,152 +43,106 @@ class V2RayVpnService : VpnService() {
         const val ACTION_STOP = "com.example.vpn.STOP"
         const val CHANNEL_ID = "v2ray_vpn_channel"
         const val NOTIFICATION_ID = 1001
+        @Volatile private var pendingServer: ServerConfig? = null
 
         fun start(context: Context, server: ServerConfig) {
-            val intent = Intent(context, V2RayVpnService::class.java).apply {
-                action = ACTION_START
-                putExtra("server_id", server.id)
-                putExtra("server_name", server.name)
-                putExtra("server_address", server.address)
-                putExtra("server_port", server.port)
-                putExtra("server_protocol", server.protocol.name)
-            }
+            pendingServer = server
+            val intent = Intent(context, V2RayVpnService::class.java).setAction(ACTION_START)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
             else context.startService(intent)
         }
 
         fun stop(context: Context) {
-            context.startService(Intent(context, V2RayVpnService::class.java).apply { action = ACTION_STOP })
+            context.startService(Intent(context, V2RayVpnService::class.java).setAction(ACTION_STOP))
         }
     }
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        Libbox.promoteOOMDraft()
+        Libbox.discardPowerReportDraft()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> {
-                val server = ServerConfig(
-                    id = intent.getLongExtra("server_id", 0L),
-                    name = intent.getStringExtra("server_name") ?: "V2Ray Server",
-                    protocol = runCatching { ProtocolType.valueOf(intent.getStringExtra("server_protocol") ?: "VMESS") }.getOrDefault(ProtocolType.VMESS),
-                    address = intent.getStringExtra("server_address") ?: "127.0.0.1",
-                    port = intent.getIntExtra("server_port", 443),
-                    uuidOrPassword = ""
-                )
-                startVpn(server)
-            }
+            ACTION_START -> pendingServer?.let { startVpn(it) }
+                ?: VpnManager.setError("No server configuration")
             ACTION_STOP -> stopVpn()
         }
         return START_NOT_STICKY
     }
 
     private fun startVpn(server: ServerConfig) {
+        serviceJob?.cancel()
         currentServer = server
         VpnManager.setConnecting(server)
         startForeground(NOTIFICATION_ID, buildNotification(server.name, "Connecting..."))
-        serviceJob?.cancel()
-        serviceJob = serviceScope.launch {
+
+        serviceJob = scope.launch {
             try {
-                val settings = SettingsRepository(applicationContext).settings.value
-                val builder = Builder()
-                    .setSession(server.name)
-                    .setMtu(1500)
-                    .addAddress("172.19.0.1", 30)
-                    .addRoute("0.0.0.0", 0)
-                    .addRoute("::", 0)
-                    .addDnsServer(settings.dnsServer.ifBlank { "1.1.1.1" })
-
-                if (settings.mode == RoutingMode.PER_APP && settings.selectedPackages.isNotEmpty()) {
-                    for (pkg in settings.selectedPackages) {
-                        runCatching {
-                            if (settings.perAppMode == PerAppMode.ALLOW_SELECTED) builder.addAllowedApplication(pkg)
-                            else builder.addDisallowedApplication(pkg)
-                        }
-                    }
+                closeCore()
+                val config = SingBoxConfigGenerator.generate(server)
+                val platformInterface = SingBoxPlatform(this@V2RayVpnService, applicationContext) { pfd ->
+                    vpnInterface = pfd
                 }
+                platform = platformInterface
+                val core = CommandServer(this@V2RayVpnService, platformInterface as PlatformInterface)
+                commandServer = core
+                core.start()
+                core.startOrReloadService(config, OverrideOptions())
 
-                val pfd = builder.establish() ?: error("Failed to establish VPN interface")
-                vpnInterface = pfd
                 sessionStartTime = System.currentTimeMillis()
                 totalUpload = 0L
                 totalDownload = 0L
-
-                // IMPORTANT: this is only the Android TUN endpoint. A real VPN data plane
-                // requires an embedded Xray/sing-box/tun2socks core to consume this FD and
-                // write proxied packets back. Do not claim CONNECTED until that bridge reports
-                // that its core is running.
                 VpnManager.setConnected(server, sessionStartTime)
-                getSystemService(NotificationManager::class.java).notify(
-                    NOTIFICATION_ID,
-                    buildNotification(server.name, "TUN active • core bridge required")
-                )
-
-                runTrafficTelemetryLoop(pfd)
+                updateNotification(server.name, "Connected • sing-box TUN")
             } catch (e: Exception) {
-                VpnManager.setError(e.localizedMessage ?: "VPN connection error")
-                stopVpn()
+                VpnManager.setError(e.message ?: "sing-box start failed")
+                closeCore()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
             }
         }
     }
 
-    private suspend fun runTrafficTelemetryLoop(pfd: ParcelFileDescriptor) {
-        // No fake traffic. Reading/discarding packets would destroy connectivity, so this loop
-        // only observes bytes that are already available and never pretends they were proxied.
-        val input = FileInputStream(pfd.fileDescriptor)
-        val buffer = ByteArray(32768)
-        var lastTick = System.currentTimeMillis()
-        var observed = 0L
-        try {
-            while (serviceScope.isActive && vpnInterface === pfd) {
-                if (input.available() > 0) {
-                    val count = input.read(buffer)
-                    if (count > 0) observed += count
-                }
-                val now = System.currentTimeMillis()
-                if (now - lastTick >= 1000) {
-                    VpnManager.updateTraffic(
-                        durationSeconds = (now - sessionStartTime) / 1000,
-                        uploadSpeedBps = observed,
-                        downloadSpeedBps = 0L,
-                        totalUploadBytes = totalUpload + observed,
-                        totalDownloadBytes = totalDownload
-                    )
-                    observed = 0L
-                    lastTick = now
-                }
-                delay(50)
-            }
-        } finally {
-            runCatching { input.close() }
-        }
+    private fun closeCore() {
+        runCatching { commandServer?.closeService() }
+        runCatching { commandServer?.close() }
+        commandServer = null
+        runCatching { platform?.close() }
+        platform = null
+        runCatching { vpnInterface?.close() }
+        vpnInterface = null
     }
 
     private fun stopVpn() {
         VpnManager.setStopping()
         serviceJob?.cancel()
         val duration = if (sessionStartTime > 0) (System.currentTimeMillis() - sessionStartTime) / 1000 else 0L
-        if (duration > 0 || totalDownload > 0 || totalUpload > 0) {
-            val server = currentServer
-            TrafficRepository(AppDatabase.getDatabase(applicationContext).trafficStatsDao()).recordSessionTraffic(
-                serverId = server?.id,
-                serverName = server?.name ?: "Direct Server",
-                uploadBytes = totalUpload,
-                downloadBytes = totalDownload,
-                durationSeconds = duration
-            )
+        val server = currentServer
+        if (duration > 0 && server != null) {
+            runCatching {
+                TrafficRepository(AppDatabase.getDatabase(applicationContext).trafficStatsDao()).recordSessionTraffic(
+                    serverId = server.id,
+                    serverName = server.name,
+                    uploadBytes = totalUpload,
+                    downloadBytes = totalDownload,
+                    durationSeconds = duration,
+                )
+            }
         }
-        runCatching { vpnInterface?.close() }
-        vpnInterface = null
+        closeCore()
+        currentServer = null
+        sessionStartTime = 0L
         VpnManager.setDisconnected()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
     override fun onDestroy() {
-        stopVpn()
+        closeCore()
+        scope.cancel()
         super.onDestroy()
     }
 
@@ -194,21 +151,39 @@ class V2RayVpnService : VpnService() {
         super.onRevoke()
     }
 
+    override fun serviceStop() = stopVpn()
+
+    override fun serviceReload() {
+        val server = currentServer ?: return
+        val config = SingBoxConfigGenerator.generate(server)
+        commandServer?.startOrReloadService(config, OverrideOptions())
+    }
+
+    override fun getSystemProxyStatus() = null
+    override fun setSystemProxyEnabled(isEnabled: Boolean) = Unit
+    override fun triggerNativeCrash() = Unit
+    override fun writeDebugMessage(message: String?) = android.util.Log.d("LightSpeed", message ?: "")
+    override fun connectSSHAgent(): Int = -1
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(
                 NotificationChannel(CHANNEL_ID, "VPN Status", NotificationManager.IMPORTANCE_LOW).apply {
                     description = "VPN connection status"
                     setShowBadge(false)
-                }
+                },
             )
         }
+    }
+
+    private fun updateNotification(title: String, content: String) {
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification(title, content))
     }
 
     private fun buildNotification(title: String, content: String): Notification {
         val launchIntent = Intent(this, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(this, 0, launchIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val stopIntent = Intent(this, V2RayVpnService::class.java).apply { action = ACTION_STOP }
+        val stopIntent = Intent(this, V2RayVpnService::class.java).setAction(ACTION_STOP)
         val stopPendingIntent = PendingIntent.getService(this, 1, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
