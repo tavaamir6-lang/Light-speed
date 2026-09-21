@@ -1,10 +1,13 @@
 package com.example.vpn
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
-import java.net.NetworkInterface
 import io.nekohasekai.libbox.BridgeOptions
 import io.nekohasekai.libbox.BridgeSession
 import io.nekohasekai.libbox.ConnectionOwner
@@ -20,6 +23,7 @@ import io.nekohasekai.libbox.ShellSession
 import io.nekohasekai.libbox.StringIterator
 import io.nekohasekai.libbox.TunOptions
 import io.nekohasekai.libbox.WIFIState
+import java.net.NetworkInterface
 
 class SingBoxPlatform(
     private val service: VpnService,
@@ -27,6 +31,9 @@ class SingBoxPlatform(
     private val onTunEstablished: (ParcelFileDescriptor) -> Unit,
 ) : PlatformInterface {
     private var tun: ParcelFileDescriptor? = null
+    private val connectivityManager =
+        context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    private var defaultNetworkCallback: ConnectivityManager.NetworkCallback? = null
 
     override fun usePlatformAutoDetectInterfaceControl(): Boolean = true
 
@@ -36,6 +43,7 @@ class SingBoxPlatform(
 
     override fun openTun(options: TunOptions): Int {
         check(VpnService.prepare(service) == null) { "android: missing VPN permission" }
+
         val builder = service.Builder()
             .setSession("Light Speed")
             .setMtu(options.mtu)
@@ -45,6 +53,7 @@ class SingBoxPlatform(
             val address = v4.next()
             builder.addAddress(address.address(), address.prefix())
         }
+
         val v6 = options.inet6Address
         while (v6.hasNext()) {
             val address = v6.next()
@@ -58,7 +67,7 @@ class SingBoxPlatform(
                     val address = r4.next()
                     builder.addRoute(address.address(), address.prefix())
                 }
-            } else {
+            } else if (options.inet4Address.hasNext()) {
                 builder.addRoute("0.0.0.0", 0)
             }
 
@@ -68,7 +77,7 @@ class SingBoxPlatform(
                     val address = r6.next()
                     builder.addRoute(address.address(), address.prefix())
                 }
-            } else {
+            } else if (options.inet6Address.hasNext()) {
                 builder.addRoute("::", 0)
             }
 
@@ -76,9 +85,14 @@ class SingBoxPlatform(
             while (dns.hasNext()) builder.addDnsServer(dns.next())
 
             val include = options.includePackage
-            while (include.hasNext()) runCatching { builder.addAllowedApplication(include.next()) }
+            while (include.hasNext()) {
+                runCatching { builder.addAllowedApplication(include.next()) }
+            }
+
             val exclude = options.excludePackage
-            while (exclude.hasNext()) runCatching { builder.addDisallowedApplication(exclude.next()) }
+            while (exclude.hasNext()) {
+                runCatching { builder.addDisallowedApplication(exclude.next()) }
+            }
         }
 
         tun?.close()
@@ -101,40 +115,149 @@ class SingBoxPlatform(
         setAndroidPackageNames(EmptyStringIterator)
     }
 
-    override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) = Unit
-    override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener) = Unit
+    override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {
+        closeDefaultInterfaceMonitor(listener)
+
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                notifyDefaultInterface(listener, network)
+            }
+
+            override fun onCapabilitiesChanged(
+                network: Network,
+                networkCapabilities: NetworkCapabilities,
+            ) {
+                notifyDefaultInterface(listener, network)
+            }
+
+            override fun onLinkPropertiesChanged(
+                network: Network,
+                linkProperties: android.net.LinkProperties,
+            ) {
+                notifyDefaultInterface(listener, network)
+            }
+
+            override fun onLost(network: Network) {
+                val current = connectivityManager.activeNetwork
+                if (current != null) {
+                    notifyDefaultInterface(listener, current)
+                } else {
+                    listener.updateDefaultInterface("", -1, false, false)
+                }
+            }
+        }
+
+        defaultNetworkCallback = callback
+        runCatching {
+            connectivityManager.registerDefaultNetworkCallback(callback)
+        }.onFailure {
+            defaultNetworkCallback = null
+            notifyCurrentDefaultInterface(listener)
+        }
+
+        notifyCurrentDefaultInterface(listener)
+    }
+
+    override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {
+        defaultNetworkCallback?.let {
+            runCatching { connectivityManager.unregisterNetworkCallback(it) }
+        }
+        defaultNetworkCallback = null
+    }
+
+    private fun notifyCurrentDefaultInterface(listener: InterfaceUpdateListener) {
+        connectivityManager.activeNetwork?.let { notifyDefaultInterface(listener, it) }
+    }
+
+    private fun notifyDefaultInterface(listener: InterfaceUpdateListener, network: Network) {
+        val linkProperties = runCatching {
+            connectivityManager.getLinkProperties(network)
+        }.getOrNull() ?: return
+
+        val interfaceName = linkProperties.interfaceName ?: return
+        val interfaceIndex = runCatching {
+            NetworkInterface.getByName(interfaceName)?.index ?: -1
+        }.getOrDefault(-1)
+
+        val capabilities = runCatching {
+            connectivityManager.getNetworkCapabilities(network)
+        }.getOrNull()
+
+        val isExpensive = capabilities?.hasCapability(
+            NetworkCapabilities.NET_CAPABILITY_NOT_METERED
+        ) == false
+
+        listener.updateDefaultInterface(
+            interfaceName,
+            interfaceIndex,
+            isExpensive,
+            false,
+        )
+    }
 
     override fun getInterfaces(): NetworkInterfaceIterator {
         val interfaces = mutableListOf<io.nekohasekai.libbox.NetworkInterface>()
-        val enumeration = runCatching { NetworkInterface.getNetworkInterfaces() }.getOrNull()
-        if (enumeration != null) {
-            while (enumeration.hasMoreElements()) {
-                val ni = enumeration.nextElement()
-                if (!ni.isUp) continue
-                val item = io.nekohasekai.libbox.NetworkInterface().apply {
-                    name = ni.name
-                    index = ni.index
-                    mtu = runCatching { ni.mtu }.getOrDefault(0)
-                    addresses = StringListIterator(
-                        ni.inetAddresses.asSequence()
-                            .map { it.hostAddress.substringBefore('%') + "/" + if (it.address.size == 16) 128 else 32 }
-                            .toList()
-                    )
-                    flags = 0
-                    type = 0
-                    dnsServer = EmptyStringIterator
-                    gateway = EmptyStringIterator
-                    metered = false
-                }
-                interfaces += item
+        val networks = runCatching { connectivityManager.allNetworks }.getOrDefault(emptyArray())
+        val javaInterfaces = runCatching { NetworkInterface.getNetworkInterfaces() }.getOrNull()
+
+        while (javaInterfaces?.hasMoreElements() == true) {
+            val ni = javaInterfaces.nextElement()
+            if (!ni.isUp) continue
+
+            val item = io.nekohasekai.libbox.NetworkInterface().apply {
+                name = ni.name
+                index = ni.index
+                mtu = runCatching { ni.mtu }.getOrDefault(0)
+                addresses = StringListIterator(
+                    ni.interfaceAddresses.map { it.address.hostAddress.orEmpty() + "/" + it.networkPrefixLength }
+                )
+                flags = 0
+                type = 0
+                dnsServer = EmptyStringIterator
+                gateway = EmptyStringIterator
+                metered = false
             }
+
+            val matchingNetwork = networks.firstOrNull { network ->
+                connectivityManager.getLinkProperties(network)?.interfaceName == ni.name
+            }
+            if (matchingNetwork != null) {
+                val lp = connectivityManager.getLinkProperties(matchingNetwork)
+                val nc = connectivityManager.getNetworkCapabilities(matchingNetwork)
+
+                item.dnsServer = StringListIterator(
+                    lp?.dnsServers?.mapNotNull { it.hostAddress }.orEmpty()
+                )
+                item.gateway = StringListIterator(
+                    lp?.routes
+                        ?.filter { it.destination.prefixLength == 0 }
+                        ?.mapNotNull { it.gateway?.hostAddress }
+                        ?.filter { it.isNotBlank() }
+                        .orEmpty()
+                )
+                item.metered = nc?.hasCapability(
+                    NetworkCapabilities.NET_CAPABILITY_NOT_METERED
+                ) == false
+                item.type = when {
+                    nc?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true -> 1
+                    nc?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true -> 2
+                    nc?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true -> 3
+                    else -> 0
+                }
+            }
+
+            interfaces += item
         }
+
         return object : NetworkInterfaceIterator {
             private var index = 0
+
             override fun hasNext(): Boolean = index < interfaces.size
+
             override fun next(): io.nekohasekai.libbox.NetworkInterface = interfaces[index++]
         }
     }
+
     override fun underNetworkExtension(): Boolean = false
     override fun includeAllNetworks(): Boolean = false
     override fun readWIFIState(): WIFIState? = null
@@ -146,6 +269,7 @@ class SingBoxPlatform(
     override fun registerMyInterface(name: String?) = Unit
     override fun usePlatformShell(): Boolean = false
     override fun checkPlatformShell() = error("platform shell is not available")
+
     override fun openShellSession(
         user: PlatformUser?,
         command: String?,
@@ -154,21 +278,34 @@ class SingBoxPlatform(
         rows: Int,
         cols: Int,
     ): ShellSession = error("platform shell is not available")
+
     override fun lookupUser(username: String?): PlatformUser = PlatformUser().apply {
         this.username = username ?: ""
         uid = android.os.Process.myUid()
         gid = android.os.Process.myUid()
         homeDir = context.filesDir.absolutePath
     }
+
     override fun lookupSFTPServer(): String = ""
     override fun readSystemSSHHostKey(): String = ""
     override fun tailscaleHostname(): String = "Light Speed"
     override fun usePlatformBridge(): Boolean = false
-    override fun createBridge(options: BridgeOptions?): BridgeSession = error("bridge requires root")
+    override fun createBridge(options: BridgeOptions?): BridgeSession =
+        error("bridge requires root")
 
     fun close() {
+        closeDefaultInterfaceMonitor(EmptyInterfaceUpdateListener)
         tun?.close()
         tun = null
+    }
+
+    private object EmptyInterfaceUpdateListener : InterfaceUpdateListener {
+        override fun updateDefaultInterface(
+            interfaceName: String,
+            interfaceIndex: Int,
+            isExpensive: Boolean,
+            isConstrained: Boolean,
+        ) = Unit
     }
 
     private object EmptyStringIterator : StringIterator {
@@ -177,8 +314,13 @@ class SingBoxPlatform(
         override fun next(): String = ""
     }
 
-    private object EmptyNetworkInterfaceIterator : NetworkInterfaceIterator {
-        override fun hasNext(): Boolean = false
-        override fun next(): io.nekohasekai.libbox.NetworkInterface = io.nekohasekai.libbox.NetworkInterface()
+    private class StringListIterator(
+        private val values: List<String>,
+    ) : StringIterator {
+        private var index = 0
+
+        override fun len(): Int = values.size
+        override fun hasNext(): Boolean = index < values.size
+        override fun next(): String = values[index++]
     }
 }
