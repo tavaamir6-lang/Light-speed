@@ -13,6 +13,7 @@ import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.data.db.AppDatabase
 import com.example.data.model.ServerConfig
+import com.example.data.repository.SettingsRepository
 import com.example.data.parser.SingBoxConfigGenerator
 import com.example.data.repository.TrafficRepository
 import io.nekohasekai.libbox.CommandServer
@@ -82,7 +83,7 @@ class V2RayVpnService : VpnService(), CommandServerHandler {
         serviceJob = scope.launch {
             try {
                 closeCore()
-                val config = SingBoxConfigGenerator.generate(server)
+                val config = SingBoxConfigGenerator.generate(server, SettingsRepository(applicationContext).settings.value)
                 val platformInterface = SingBoxPlatform(this@V2RayVpnService, applicationContext) { pfd ->
                     vpnInterface = pfd
                 }
