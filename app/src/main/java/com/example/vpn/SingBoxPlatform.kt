@@ -174,8 +174,19 @@ class SingBoxPlatform(
         }
 
         defaultNetworkCallback = callback
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
+            .build()
+
         runCatching {
-            connectivityManager.registerDefaultNetworkCallback(callback)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                connectivityManager.registerBestMatchingNetworkCallback(request, callback, null)
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                connectivityManager.requestNetwork(request, callback)
+            } else {
+                connectivityManager.registerDefaultNetworkCallback(callback)
+            }
         }.onFailure {
             defaultNetworkCallback = null
             notifyCurrentDefaultInterface(listener)
