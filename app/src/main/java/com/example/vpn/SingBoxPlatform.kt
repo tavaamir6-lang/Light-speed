@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import java.net.NetworkInterface
 import io.nekohasekai.libbox.BridgeOptions
 import io.nekohasekai.libbox.BridgeSession
 import io.nekohasekai.libbox.ConnectionOwner
@@ -102,7 +103,43 @@ class SingBoxPlatform(
 
     override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) = Unit
     override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener) = Unit
-    override fun getInterfaces(): NetworkInterfaceIterator = EmptyNetworkInterfaceIterator
+
+    override fun getInterfaces(): NetworkInterfaceIterator {
+        val interfaces = mutableListOf<io.nekohasekai.libbox.NetworkInterface>()
+        val enumeration = runCatching { NetworkInterface.getNetworkInterfaces() }.getOrNull()
+        if (enumeration != null) {
+            while (enumeration.hasMoreElements()) {
+                val ni = enumeration.nextElement()
+                if (!ni.isUp) continue
+                val item = io.nekohasekai.libbox.NetworkInterface().apply {
+                    name = ni.name
+                    index = ni.index
+                    mtu = runCatching { ni.mtu }.getOrDefault(0)
+                    addresses = StringListIterator(
+                        ni.inetAddresses.asSequence()
+                            .map { it.hostAddress.substringBefore('%') + "/" + if (it.address.size == 16) 128 else 32 }
+                            .toList()
+                    )
+                    flags = 0
+                    type = when {
+                        ni.name.startsWith("wlan", true) -> io.nekohasekai.libbox.PlatformInterface.InterfaceTypeWIFI
+                        ni.name.startsWith("rmnet", true) || ni.name.startsWith("ccmni", true) || ni.name.startsWith("pdp", true) -> io.nekohasekai.libbox.PlatformInterface.InterfaceTypeCellular
+                        ni.name.startsWith("eth", true) -> io.nekohasekai.libbox.PlatformInterface.InterfaceTypeEthernet
+                        else -> io.nekohasekai.libbox.PlatformInterface.InterfaceTypeOther
+                    }
+                    dnsServer = EmptyStringIterator
+                    gateway = EmptyStringIterator
+                    metered = false
+                }
+                interfaces += item
+            }
+        }
+        return object : NetworkInterfaceIterator {
+            private var index = 0
+            override fun hasNext(): Boolean = index < interfaces.size
+            override fun next(): io.nekohasekai.libbox.NetworkInterface = interfaces[index++]
+        }
+    }
     override fun underNetworkExtension(): Boolean = false
     override fun includeAllNetworks(): Boolean = false
     override fun readWIFIState(): WIFIState? = null
