@@ -1,12 +1,15 @@
 package com.example.data.parser
 
+import com.example.data.model.PerAppMode
 import com.example.data.model.ProtocolType
+import com.example.data.model.RoutingMode
+import com.example.data.model.RoutingSettings
 import com.example.data.model.ServerConfig
 import org.json.JSONArray
 import org.json.JSONObject
 
 object SingBoxConfigGenerator {
-    fun generate(server: ServerConfig): String {
+    fun generate(server: ServerConfig, settings: RoutingSettings = RoutingSettings()): String {
         val outbound = buildOutbound(server)
         val tun = JSONObject()
             .put("type", "tun")
@@ -22,18 +25,39 @@ object SingBoxConfigGenerator {
             .put("override_android_vpn", true)
             .put("final", "proxy")
 
+        if (settings.mode == RoutingMode.BYPASS_LAN) {
+            route.put("rules", JSONArray().put(
+                JSONObject()
+                    .put("ip_is_private", true)
+                    .put("action", "route")
+                    .put("outbound", "direct")
+            ))
+        }
+
         val dns = JSONObject()
             .put("servers", JSONArray()
-                .put(JSONObject().put("type", "https").put("tag", "cloudflare").put("server", "1.1.1.1").put("path", "/dns-query")))
+                .put(JSONObject().put("type", "https").put("tag", "cloudflare").put("server", settings.dnsServer.ifBlank { "1.1.1.1" }).put("path", "/dns-query")))
             .put("final", "cloudflare")
 
         return JSONObject()
             .put("log", JSONObject().put("level", "warn"))
             .put("dns", dns)
-            .put("inbounds", JSONArray().put(tun))
+            .put("inbounds", JSONArray().put(applyRoutingSettings(tun, settings)))
             .put("outbounds", JSONArray().put(outbound).put(JSONObject().put("type", "direct").put("tag", "direct")))
             .put("route", route)
             .toString()
+    }
+
+    private fun applyRoutingSettings(tun: JSONObject, settings: RoutingSettings): JSONObject {
+        if (settings.mode == RoutingMode.PER_APP && settings.selectedPackages.isNotEmpty()) {
+            val packages = JSONArray()
+            settings.selectedPackages.forEach { packages.put(it) }
+            when (settings.perAppMode) {
+                PerAppMode.ALLOW_SELECTED -> tun.put("include_package", packages)
+                PerAppMode.BYPASS_SELECTED -> tun.put("exclude_package", packages)
+            }
+        }
+        return tun
     }
 
     private fun buildOutbound(server: ServerConfig): JSONObject {
