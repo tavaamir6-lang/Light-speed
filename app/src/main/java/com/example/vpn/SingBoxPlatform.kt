@@ -35,6 +35,8 @@ class SingBoxPlatform(
         context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     private var defaultNetworkCallback: ConnectivityManager.NetworkCallback? = null
 
+    override fun localDNSTransport(): LocalDNSTransport = LocalResolver
+
     override fun usePlatformAutoDetectInterfaceControl(): Boolean = true
 
     override fun autoDetectInterfaceControl(fd: Int) {
@@ -109,10 +111,34 @@ class SingBoxPlatform(
         sourcePort: Int,
         destinationAddress: String,
         destinationPort: Int,
-    ): ConnectionOwner = ConnectionOwner().apply {
-        userId = -1
-        userName = ""
-        setAndroidPackageNames(EmptyStringIterator)
+    ): ConnectionOwner {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return ConnectionOwner().apply {
+                userId = -1
+                userName = ""
+                setAndroidPackageNames(EmptyStringIterator)
+            }
+        }
+
+        return runCatching {
+            val uid = connectivityManager.getConnectionOwnerUid(
+                ipProtocol,
+                java.net.InetSocketAddress(sourceAddress, sourcePort),
+                java.net.InetSocketAddress(destinationAddress, destinationPort),
+            )
+            val packages = context.packageManager.getPackagesForUid(uid)?.toList().orEmpty()
+            ConnectionOwner().apply {
+                userId = uid
+                userName = packages.firstOrNull().orEmpty()
+                setAndroidPackageNames(StringListIterator(packages))
+            }
+        }.getOrElse {
+            ConnectionOwner().apply {
+                userId = -1
+                userName = ""
+                setAndroidPackageNames(EmptyStringIterator)
+            }
+        }
     }
 
     override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {
