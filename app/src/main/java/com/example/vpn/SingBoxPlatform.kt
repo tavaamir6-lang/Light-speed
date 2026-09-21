@@ -121,12 +121,7 @@ class SingBoxPlatform(
                             .toList()
                     )
                     flags = 0
-                    type = when {
-                        ni.name.startsWith("wlan", true) -> io.nekohasekai.libbox.PlatformInterface.InterfaceTypeWIFI
-                        ni.name.startsWith("rmnet", true) || ni.name.startsWith("ccmni", true) || ni.name.startsWith("pdp", true) -> io.nekohasekai.libbox.PlatformInterface.InterfaceTypeCellular
-                        ni.name.startsWith("eth", true) -> io.nekohasekai.libbox.PlatformInterface.InterfaceTypeEthernet
-                        else -> io.nekohasekai.libbox.PlatformInterface.InterfaceTypeOther
-                    }
+                    type = 0
                     dnsServer = EmptyStringIterator
                     gateway = EmptyStringIterator
                     metered = false
