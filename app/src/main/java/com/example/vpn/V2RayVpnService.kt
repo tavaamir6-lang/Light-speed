@@ -9,6 +9,7 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import java.io.File
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.data.db.AppDatabase
@@ -61,6 +62,11 @@ class V2RayVpnService : VpnService(), CommandServerHandler {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        val basePath = File(filesDir, "libbox").apply { mkdirs() }
+        val workingPath = File(filesDir, "libbox-working").apply { mkdirs() }
+        val tempPath = File(cacheDir, "libbox-temp").apply { mkdirs() }
+        Libbox.setup(basePath.absolutePath, workingPath.absolutePath, tempPath.absolutePath, false)
+        DefaultNetworkHolder.start(applicationContext)
         Libbox.promoteOOMDraft()
         Libbox.discardPowerReportDraft()
     }
@@ -143,6 +149,7 @@ class V2RayVpnService : VpnService(), CommandServerHandler {
 
     override fun onDestroy() {
         closeCore()
+        DefaultNetworkHolder.stop(applicationContext)
         scope.cancel()
         super.onDestroy()
     }
@@ -156,7 +163,7 @@ class V2RayVpnService : VpnService(), CommandServerHandler {
 
     override fun serviceReload() {
         val server = currentServer ?: return
-        val config = SingBoxConfigGenerator.generate(server)
+        val config = SingBoxConfigGenerator.generate(server, SettingsRepository(applicationContext).settings.value)
         commandServer?.startOrReloadService(config, OverrideOptions())
     }
 
