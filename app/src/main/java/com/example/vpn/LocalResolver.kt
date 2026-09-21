@@ -130,7 +130,19 @@ object DefaultNetworkHolder {
                 }
             }
             callback = cb
-            runCatching { cm.registerDefaultNetworkCallback(cb) }
+            val request = android.net.NetworkRequest.Builder()
+                .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
+                .build()
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    cm.registerBestMatchingNetworkCallback(request, cb, null)
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    cm.requestNetwork(request, cb)
+                } else {
+                    cm.registerDefaultNetworkCallback(cb)
+                }
+            }
         }
     }
 
